@@ -1,5 +1,4 @@
 <!DOCTYPE html>
-
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -9,6 +8,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Montserrat',sans-serif;font-size:14px;color:#1a1a1a;background:#f5f5f3;min-height:100vh;font-weight:400;letter-spacing:0.01em}
@@ -589,42 +589,52 @@ function getImageDimensions(dataUrl){
 }
 
 async function renderPDFPagesToImages(file){
+  // NOTE: this rasterising path is now only a *fallback* used when a receipt
+  // PDF can't be merged natively (see appendOriginalPdf in buildPDF). It used
+  // to be the only path, rendered at scale 1.2 (~86 DPI) and crushed down to
+  // JPEG quality 0.15 to hit a 300KB cap — that combination is what produced
+  // the blurry receipts. We render sharper and keep a much higher quality
+  // floor here, since this should rarely run at all.
   const arrayBuffer=await readFileAsArrayBuffer(file);
   const pdfDoc=await pdfjsLib.getDocument({data:arrayBuffer}).promise;
   const images=[];
   for(let pageNum=1;pageNum<=pdfDoc.numPages;pageNum++){
     const page=await pdfDoc.getPage(pageNum);
-    const scale=1.2;
+    const scale=2.0; // ~144 DPI — legible for small receipt print
     const viewport=page.getViewport({scale});
     const canvas=document.createElement('canvas');
     canvas.width=viewport.width;canvas.height=viewport.height;
     const ctx=canvas.getContext('2d');
     await page.render({canvasContext:ctx,viewport}).promise;
-    // Iterative compression for PDF pages too
-      let pdfDataUrl=canvas.toDataURL('image/jpeg',0.50);
+    // Iterative compression, but with a much higher quality floor (0.6) and
+    // a more generous size target (900KB) than before.
+      let pdfDataUrl=canvas.toDataURL('image/jpeg',0.85);
       let pdfBytes=(pdfDataUrl.length-'data:image/jpeg;base64,'.length)*0.75;
-      let pdfQ=0.50;
-      while(pdfBytes>300*1024&&pdfQ>0.15){
-        pdfQ=Math.max(pdfQ-0.10,0.15);
+      let pdfQ=0.85;
+      while(pdfBytes>900*1024&&pdfQ>0.6){
+        pdfQ=Math.max(pdfQ-0.05,0.6);
         pdfDataUrl=canvas.toDataURL('image/jpeg',pdfQ);
         pdfBytes=(pdfDataUrl.length-'data:image/jpeg;base64,'.length)*0.75;
       }
-      console.log('PDF page: '+canvas.width+'x'+canvas.height+'px, '+Math.round(pdfBytes/1024)+'KB');
+      console.log('PDF page (fallback raster): '+canvas.width+'x'+canvas.height+'px, '+Math.round(pdfBytes/1024)+'KB, q='+pdfQ.toFixed(2));
       images.push({dataUrl:pdfDataUrl,w:canvas.width,h:canvas.height});
   }
   return images;
 }
 
-function compressImage(dataUrl, maxPx, quality){
+// Re-encodes an image to fit within maxPx (longest side) and maxBytes,
+// starting at `quality` and only stepping DOWN to a floor of 0.6 — never
+// the old 0.15 floor that made receipts unreadable.
+function compressImage(dataUrl, maxPx, quality, maxBytes){
+  maxBytes = maxBytes || 900*1024;
   return new Promise(resolve=>{
     const img=new Image();
-    img.onload=async function(){
+    img.onload=function(){
       let w=img.width, h=img.height;
-      // Scale down to maxPx
-      if(w>=h){h=Math.round(h*(maxPx/w));w=maxPx;}
-      else{w=Math.round(w*(maxPx/h));h=maxPx;}
-      // Never upscale
-      if(w>img.width){w=img.width;h=img.height;}
+      if(Math.max(w,h)>maxPx){
+        if(w>=h){h=Math.round(h*(maxPx/w));w=maxPx;}
+        else{w=Math.round(w*(maxPx/h));h=maxPx;}
+      }
       const cvs=document.createElement('canvas');
       cvs.width=w;cvs.height=h;
       const ctx=cvs.getContext('2d');
@@ -632,12 +642,10 @@ function compressImage(dataUrl, maxPx, quality){
       ctx.fillRect(0,0,w,h);
       ctx.drawImage(img,0,0,w,h);
       let result=cvs.toDataURL('image/jpeg',quality);
-      // ── Iterative compression: if still >300KB, reduce quality further
-      const maxBytes=300*1024; // 300KB target
       let base64Bytes=(result.length-'data:image/jpeg;base64,'.length)*0.75;
       let q=quality;
-      while(base64Bytes>maxBytes&&q>0.15){
-        q=Math.max(q-0.10,0.15);
+      while(base64Bytes>maxBytes&&q>0.6){
+        q=Math.max(q-0.05,0.6);
         result=cvs.toDataURL('image/jpeg',q);
         base64Bytes=(result.length-'data:image/jpeg;base64,'.length)*0.75;
         console.log('Re-compressed at q='+q.toFixed(2)+', size='+Math.round(base64Bytes/1024)+'KB');
@@ -650,9 +658,41 @@ function compressImage(dataUrl, maxPx, quality){
   });
 }
 
+// Decides whether a receipt image needs any re-encoding at all. Most phone
+// photos / screenshots of receipts are already well within these limits —
+// in that case we embed the ORIGINAL bytes untouched (zero quality loss).
+// Only oversized originals get resized/re-encoded, and only down to a high
+// quality (0.85) — never the aggressive 0.15 the old code used on every
+// single receipt regardless of its original size.
+async function prepareReceiptImage(file){
+  const MAX_DIM=2200;       // plenty for reading small print on a receipt
+  const MAX_BYTES=900*1024; // soft per-receipt budget
+  const isJpeg=file.type==='image/jpeg'||file.type==='image/jpg';
+  const isPng=file.type==='image/png';
+  const rawDataUrl=await readFileAsDataURL(file);
+  const commaIdx=rawDataUrl.indexOf(',');
+  const rawBytes=(rawDataUrl.length-commaIdx-1)*0.75;
+  const dims=await getImageDimensions(rawDataUrl);
+  const withinBudget=Math.max(dims.w,dims.h)<=MAX_DIM&&rawBytes<=MAX_BYTES;
+  if(withinBudget&&(isJpeg||isPng)){
+    // Original is already a JPEG/PNG within budget — these are formats
+    // jsPDF/pdf-lib embed natively, so we pass the exact original bytes
+    // straight through. Zero quality loss.
+    console.log('Receipt image passed through unmodified: '+file.name+' ('+dims.w+'x'+dims.h+'px, '+Math.round(rawBytes/1024)+'KB)');
+    return{dataUrl:rawDataUrl,w:dims.w,h:dims.h,fmt:isPng?'PNG':'JPEG'};
+  }
+  // Anything oversized, or a format jsPDF can't embed directly (e.g. WEBP/
+  // HEIC/GIF), gets normalised via canvas to a high-quality JPEG.
+  const dataUrl=await compressImage(rawDataUrl,MAX_DIM,0.85,MAX_BYTES);
+  const newDims=await getImageDimensions(dataUrl);
+  return{dataUrl,w:newDims.w,h:newDims.h,fmt:'JPEG'};
+}
+
 async function buildPDF(declNum,prop,empName,date,iban,swift,message,lineData,tG,tN,tV){
   const{jsPDF}=window.jspdf;
-  const doc=new jsPDF({orientation:'portrait',unit:'mm',format:'a4'});
+  // compress:true turns on jsPDF's built-in (lossless) PDF stream compression —
+  // a free size reduction for the text/table pages that doesn't touch image quality.
+  const doc=new jsPDF({orientation:'portrait',unit:'mm',format:'a4',compress:true});
   registerMontserratInDoc(doc);
   const FONT='helvetica';
   const pw=210,ph=297,ml=15,mr=15,mt=18,usableW=pw-ml-mr;
@@ -754,6 +794,43 @@ async function buildPDF(declNum,prop,empName,date,iban,swift,message,lineData,tG
     y+=6;
   });
   footer();
+  if(doc.putTotalPages) doc.putTotalPages(pageNum); // total pages of the cover/summary section itself
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Receipts are no longer rasterised into this same jsPDF document.
+  // Instead, each piece is built as its own tiny PDF (via jsPDF, with
+  // compress:true) and then stitched together with the cover section using
+  // pdf-lib — which can copy pages from a real PDF receipt byte-for-byte
+  // (no rasterising, no re-compression, full original quality), and can
+  // losslessly re-pack everything into one compact output PDF. Still a
+  // single .pdf file — no ZIP involved.
+  // ─────────────────────────────────────────────────────────────────────
+  const{PDFDocument}=window.PDFLib;
+  const merged=await PDFDocument.create();
+
+  async function appendDocPages(jspdfDoc){
+    const bytes=jspdfDoc.output('arraybuffer');
+    const src=await PDFDocument.load(bytes);
+    (await merged.copyPages(src,src.getPageIndices())).forEach(p=>merged.addPage(p));
+  }
+  async function appendOriginalPdf(file){
+    const bytes=await readFileAsArrayBuffer(file);
+    const src=await PDFDocument.load(bytes,{ignoreEncryption:true});
+    (await merged.copyPages(src,src.getPageIndices())).forEach(p=>merged.addPage(p));
+  }
+  function makeLabelDoc(line1,line2){
+    const d=new jsPDF({orientation:'portrait',unit:'mm',format:'a4',compress:true});
+    registerMontserratInDoc(d);
+    let yy=mt;
+    d.setFontSize(8);d.setFont(FONT,'bold');d.setTextColor(40,40,40);
+    d.text(line1,ml,yy);yy+=5;
+    d.setFont(FONT,'normal');d.setFontSize(7);d.setTextColor(150,150,150);
+    d.text(line2,ml,yy);yy+=4;
+    d.setDrawColor(225,225,220);d.setLineWidth(0.2);d.line(ml,yy,pw-mr,yy);
+    return d;
+  }
+
+  await appendDocPages(doc); // the cover/summary section built above
 
   // Flatten all receipts across lines
   const receiptItems=[];
@@ -761,75 +838,95 @@ async function buildPDF(declNum,prop,empName,date,iban,swift,message,lineData,tG
     const recs=l.receipts&&l.receipts.length>0?l.receipts:(l.receipt?[l.receipt]:[]);
     recs.forEach((rec,ri)=>receiptItems.push({line:l,lineIdx:li,receipt:rec,recIdx:ri,total:recs.length}));
   });
+
   for(let i=0;i<receiptItems.length;i++){
     const{line:l,lineIdx,receipt:file,recIdx,total}=receiptItems[i];
     const prog=document.getElementById('progress-msg');
     if(prog) prog.textContent=`Processing receipt ${i+1} of ${receiptItems.length} — ${file.name}...`;
 
-    newPage();
-    doc.setFontSize(8);doc.setFont(FONT,'bold');doc.setTextColor(40,40,40);
-    const recLabel=total>1?` (file ${recIdx+1} of ${total})`:'';doc.text('Receipt '+(i+1)+' of '+receiptItems.length+' — Line '+(lineIdx+1)+': '+l.desc+recLabel,ml,y);y+=5;
-    doc.setFont(FONT,'normal');doc.setFontSize(7);doc.setTextColor(150,150,150);
-    doc.text(l.cat+' · '+sym+' '+l.gross+' · '+l.treatment,ml,y);y+=4;
-    hline(y);y+=7;
+    const recLabel=total>1?` (file ${recIdx+1} of ${total})`:'';
+    const line1='Receipt '+(i+1)+' of '+receiptItems.length+' — Line '+(lineIdx+1)+': '+l.desc+recLabel;
+    const line2=l.cat+' · '+sym+' '+l.gross+' · '+l.treatment;
 
     const isPDF=file.type==='application/pdf';
     if(isPDF){
       try{
-        const pages=await renderPDFPagesToImages(file);
-        for(let p=0;p<pages.length;p++){
-          if(p>0){newPage();y+=4;}
-          const pg=pages[p];
-          const maxW=usableW,maxH=ph-y-20;
-          const pxToMm=0.264583;
-          const naturalW=pg.w*pxToMm,naturalH=pg.h*pxToMm;
-          const scaleByW=maxW/naturalW;
-          const scaledH=naturalH*scaleByW;
-          const iw=maxW,ih=Math.min(scaledH,maxH);
-          doc.addImage(pg.dataUrl,'JPEG',ml,y,iw,ih);
-        }
+        // Best case: the receipt is already a PDF — merge its real pages in
+        // directly. Full original quality (text, vectors, embedded images
+        // all untouched), and no rasterising/JPEG step to bloat the size.
+        await appendDocPages(makeLabelDoc(line1,line2));
+        await appendOriginalPdf(file);
       }catch(e){
-        doc.setFontSize(9);doc.setTextColor(160,80,80);
-        doc.text('Could not render PDF: '+file.name+' — please attach original.',ml,y);
+        // Fallback for a PDF pdf-lib can't parse (e.g. unusual encryption):
+        // rasterise it, same as the previous behaviour, but at a higher
+        // quality (see renderPDFPagesToImages above).
+        try{
+          const d=makeLabelDoc(line1,line2);
+          let yy=mt+13;
+          const pages=await renderPDFPagesToImages(file);
+          for(let p=0;p<pages.length;p++){
+            if(p>0){d.addPage();yy=mt;}
+            const pg=pages[p];
+            const maxW=usableW,maxH=ph-yy-20;
+            const pxToMm=0.264583;
+            const naturalW=pg.w*pxToMm,naturalH=pg.h*pxToMm;
+            const scaleByW=maxW/naturalW;
+            const scaledH=naturalH*scaleByW;
+            const iw=maxW,ih=Math.min(scaledH,maxH);
+            d.addImage(pg.dataUrl,'JPEG',ml,yy,iw,ih);
+          }
+          await appendDocPages(d);
+        }catch(e2){
+          const d=makeLabelDoc(line1,line2);
+          d.setFontSize(9);d.setTextColor(160,80,80);
+          d.text('Could not render PDF: '+file.name+' — please attach original.',ml,mt+13);
+          await appendDocPages(d);
+        }
       }
     } else {
       try{
-        const rawDataUrl=await readFileAsDataURL(file);
-        // Compress image to max 1500px and 70% quality before embedding
-        const dataUrl=await compressImage(rawDataUrl,1200,0.50);
-        const dims=await getImageDimensions(dataUrl);
-        const maxW=usableW,maxH=ph-y-20;
+        const d=makeLabelDoc(line1,line2);
+        const yy=mt+13;
+        const{dataUrl,w:imgW,h:imgH,fmt}=await prepareReceiptImage(file);
+        const maxW=usableW,maxH=ph-yy-20;
         const pxToMm=0.264583;
-        const naturalW=dims.w*pxToMm, naturalH=dims.h*pxToMm;
+        const naturalW=imgW*pxToMm, naturalH=imgH*pxToMm;
         const scaleByW=maxW/naturalW;
         const scaledH=naturalH*scaleByW;
         const iw=maxW, ih=Math.min(scaledH,maxH);
-        doc.addImage(dataUrl,'JPEG',ml,y,iw,ih);
+        d.addImage(dataUrl,fmt,ml,yy,iw,ih);
+        await appendDocPages(d);
       }catch(e){
-        doc.setFontSize(9);doc.setTextColor(160,80,80);
-        doc.text('Could not embed image: '+file.name,ml,y);
+        const d=makeLabelDoc(line1,line2);
+        d.setFontSize(9);d.setTextColor(160,80,80);
+        d.text('Could not embed image: '+file.name,ml,mt+13);
+        await appendDocPages(d);
       }
     }
   }
-  // Signature line on last page
-  check(28);
-  y+=8;
-  hline(y);y+=8;
-  doc.setFontSize(8);doc.setFont(FONT,'normal');doc.setTextColor(80,80,80);
-  doc.text('I confirm that the expenses declared above are accurate, business-related, and supported by the attached receipts.',ml,y);
-  y+=10;
-  doc.setDrawColor(180,180,180);doc.setLineWidth(0.3);
-  doc.line(ml,y,ml+70,y);
-  doc.line(ml+90,y,ml+130,y);
-  doc.line(ml+150,y,pw-mr,y);
-  y+=4;
-  doc.setFontSize(7);doc.setTextColor(160,160,160);
-  doc.text('Signature',ml,y);
-  doc.text('Date',ml+90,y);
-  doc.text('Name',ml+150,y);
 
-  if(doc.putTotalPages) doc.putTotalPages(totalPagesExp);
-  return{doc,pdfFilename:declNum+'-declaration.pdf'};
+  // Signature block — its own final page.
+  const sigDoc=new jsPDF({orientation:'portrait',unit:'mm',format:'a4',compress:true});
+  registerMontserratInDoc(sigDoc);
+  (function(){
+    let yy=mt;
+    sigDoc.setFontSize(8);sigDoc.setFont(FONT,'normal');sigDoc.setTextColor(80,80,80);
+    sigDoc.text('I confirm that the expenses declared above are accurate, business-related, and supported by the attached receipts.',ml,yy);
+    yy+=10;
+    sigDoc.setDrawColor(180,180,180);sigDoc.setLineWidth(0.3);
+    sigDoc.line(ml,yy,ml+70,yy);
+    sigDoc.line(ml+90,yy,ml+130,yy);
+    sigDoc.line(ml+150,yy,pw-mr,yy);
+    yy+=4;
+    sigDoc.setFontSize(7);sigDoc.setTextColor(160,160,160);
+    sigDoc.text('Signature',ml,yy);
+    sigDoc.text('Date',ml+90,yy);
+    sigDoc.text('Name',ml+150,yy);
+  })();
+  await appendDocPages(sigDoc);
+
+  const mergedBytes=await merged.save();
+  return{bytes:mergedBytes,pdfFilename:declNum+'-declaration.pdf'};
 }
 
 let _lastPdfFilename = '';
@@ -874,8 +971,13 @@ async function handleSubmit(){
   prog.textContent='Building PDF — please wait...';
 
   try{
-    const{doc,pdfFilename}=await buildPDF(declNum,prop,empName,date,iban,swift,message,lineData,tG,tN,tV);
-    doc.save(pdfFilename);
+    const{bytes,pdfFilename}=await buildPDF(declNum,prop,empName,date,iban,swift,message,lineData,tG,tN,tV);
+    const blob=new Blob([bytes],{type:'application/pdf'});
+    const blobUrl=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=blobUrl;a.download=pdfFilename;
+    document.body.appendChild(a);a.click();document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(blobUrl),10000);
     prog.style.display='none';
     await new Promise(r=>setTimeout(r,700));
 
@@ -1081,3 +1183,4 @@ function getExpectedIBANCountry(){
 </script>
 </body>
 </html>
+
